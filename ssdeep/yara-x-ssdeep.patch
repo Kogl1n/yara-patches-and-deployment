@@ -1,0 +1,611 @@
+diff --git a/lib/src/modules/hash/mod.rs b/lib/src/modules/hash/mod.rs
+index dbd94450..8fb5f1de 100644
+--- a/lib/src/modules/hash/mod.rs
++++ b/lib/src/modules/hash/mod.rs
+@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
+ use crate::mods::prelude::*;
+ use crate::modules::protos::hash::*;
+ 
++mod ssdeep;
++
+ #[cfg(test)]
+ mod tests;
+ 
+@@ -26,6 +28,9 @@ thread_local!(
+ 
+     static CHECKSUM32_CACHE: RefCell<FxHashMap<(i64, i64), i64>> =
+         RefCell::new(FxHashMap::default());
++
++    static SSDEEP_CACHE: RefCell<FxHashMap<(i64, i64), String>> =
++        RefCell::new(FxHashMap::default());
+ );
+ 
+ fn main(_ctx: &mut ModuleContext, _data: &[u8]) -> Result<Hash, ModuleError> {
+@@ -35,6 +40,7 @@ fn main(_ctx: &mut ModuleContext, _data: &[u8]) -> Result<Hash, ModuleError> {
+     MD5_CACHE.with(|cache| cache.borrow_mut().clear());
+     CRC32_CACHE.with(|cache| cache.borrow_mut().clear());
+     CHECKSUM32_CACHE.with(|cache| cache.borrow_mut().clear());
++    SSDEEP_CACHE.with(|cache| cache.borrow_mut().clear());
+ 
+     Ok(Hash::new())
+ }
+@@ -265,4 +271,49 @@ fn checksum_str(ctx: &ScanContext, s: RuntimeString) -> Option<i64> {
+     Some(checksum32(s.as_bstr(ctx).as_bytes()).into())
+ }
+ 
++/// Calculates the ssdeep fuzzy hash of a portion of the scanned data.
++#[module_export(name = "ssdeep")]
++fn ssdeep_data(
++    ctx: &mut ScanContext,
++    offset: i64,
++    size: i64,
++) -> Option<RuntimeString> {
++    let cached = SSDEEP_CACHE
++        .with(|cache| cache.borrow().get(&(offset, size)).cloned());
++
++    if let Some(digest) = cached {
++        return Some(RuntimeString::new(digest));
++    }
++
++    let data = data_slice(ctx, offset, size)?;
++    let digest = ssdeep::hash(data)?;
++
++    SSDEEP_CACHE.with(|cache| {
++        cache.borrow_mut().insert((offset, size), digest.clone());
++    });
++
++    Some(RuntimeString::new(digest))
++}
++
++/// Calculates the ssdeep fuzzy hash of a string.
++#[module_export(name = "ssdeep")]
++fn ssdeep_str(ctx: &mut ScanContext, s: RuntimeString) -> Option<RuntimeString> {
++    Some(RuntimeString::new(ssdeep::hash(s.as_bstr(ctx))?))
++}
++
++/// Compares two ssdeep fuzzy hashes and returns a similarity score between
++/// 0 (no similarity) and 100 (identical or near-identical). The result is
++/// undefined if any of the hashes is malformed.
++#[module_export(name = "ssdeep_compare")]
++fn ssdeep_compare(
++    ctx: &mut ScanContext,
++    hash1: RuntimeString,
++    hash2: RuntimeString,
++) -> Option<i64> {
++    let hash1 = hash1.as_bstr(ctx).to_str().ok()?;
++    let hash2 = hash2.as_bstr(ctx).to_str().ok()?;
++
++    Some(ssdeep::compare(hash1, hash2)?.into())
++}
++
+ register_module!("hash", Hash, main);
+diff --git a/lib/src/modules/hash/ssdeep.rs b/lib/src/modules/hash/ssdeep.rs
+new file mode 100644
+index 00000000..2929fb54
+--- /dev/null
++++ b/lib/src/modules/hash/ssdeep.rs
+@@ -0,0 +1,416 @@
++//! Context triggered piecewise hashing (CTPH), also known as ssdeep.
++//!
++//! This is an implementation of the algorithm described by Jesse Kornblum in
++//! "Identifying almost identical files using context triggered piecewise
++//! hashing" (Digital Investigation, 2006), which is in turn based on Andrew
++//! Tridgell's spamsum. The digests produced by [`hash`] and the scores
++//! produced by [`compare`] are compatible with those of the `ssdeep` tool
++//! (libfuzzy 2.14), which are also the values shown by VirusTotal.
++
++/// Size of the rolling hash window.
++const ROLLING_WINDOW: usize = 7;
++
++/// Smallest block size.
++const MIN_BLOCK_SIZE: u64 = 3;
++
++/// Maximum length of each part of the digest.
++const SPAMSUM_LENGTH: usize = 64;
++
++/// Number of block sizes (MIN_BLOCK_SIZE * 2^i, i in 0..NUM_BLOCK_HASHES).
++const NUM_BLOCK_HASHES: usize = 31;
++
++/// Initial value of the piecewise hashes, only the lower 6 bits matter.
++const HASH_INIT: u32 = 0x28021967;
++
++/// Multiplier of the FNV-style piecewise hash.
++const HASH_PRIME: u32 = 0x01000193;
++
++const B64: &[u8; 64] =
++    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++#[inline]
++fn block_size(index: usize) -> u64 {
++    MIN_BLOCK_SIZE << index
++}
++
++#[inline]
++fn sum_hash(c: u8, h: u32) -> u32 {
++    h.wrapping_mul(HASH_PRIME) ^ (c as u32)
++}
++
++/// Rolling hash over the last [`ROLLING_WINDOW`] bytes. It is the sum of
++/// three components: the sum of the bytes, a sum weighted by position, and a
++/// shift/xor hash.
++#[derive(Default)]
++struct RollingHash {
++    window: [u8; ROLLING_WINDOW],
++    h1: u32,
++    h2: u32,
++    h3: u32,
++    n: usize,
++}
++
++impl RollingHash {
++    #[inline]
++    fn update(&mut self, c: u8) {
++        self.h2 = self.h2.wrapping_sub(self.h1);
++        self.h2 = self.h2.wrapping_add(ROLLING_WINDOW as u32 * c as u32);
++        self.h1 = self.h1.wrapping_add(c as u32);
++        self.h1 = self.h1.wrapping_sub(self.window[self.n] as u32);
++        self.window[self.n] = c;
++        self.n = (self.n + 1) % ROLLING_WINDOW;
++        self.h3 = (self.h3 << 5) ^ (c as u32);
++    }
++
++    #[inline]
++    fn sum(&self) -> u32 {
++        self.h1.wrapping_add(self.h2).wrapping_add(self.h3)
++    }
++}
++
++/// State of the piecewise hash for a single block size.
++#[derive(Clone)]
++struct BlockHash {
++    /// Hash of the current piece.
++    h: u32,
++    /// Hash of the current piece, used for the truncated (half) digest.
++    half_h: u32,
++    digest: [u8; SPAMSUM_LENGTH],
++    /// Last character of the truncated digest.
++    half_digest: Option<u8>,
++    len: usize,
++}
++
++impl BlockHash {
++    fn new() -> Self {
++        Self {
++            h: HASH_INIT,
++            half_h: HASH_INIT,
++            digest: [0; SPAMSUM_LENGTH],
++            half_digest: None,
++            len: 0,
++        }
++    }
++}
++
++struct Hasher {
++    roll: RollingHash,
++    blocks: Vec<BlockHash>,
++    /// Index of the smallest block size still being considered.
++    start: usize,
++    /// Hash of the last piece for the largest block size, only computed
++    /// once all block sizes are in use.
++    last_h: Option<u32>,
++    /// Total input length.
++    total_size: u64,
++}
++
++impl Hasher {
++    fn new(total_size: u64) -> Self {
++        Self {
++            roll: RollingHash::default(),
++            blocks: vec![BlockHash::new()],
++            start: 0,
++            last_h: None,
++            total_size,
++        }
++    }
++
++    /// Starts computing the hash for the next block size, which until now
++    /// had exactly the same state as the current largest one.
++    fn fork(&mut self) {
++        let last = self.blocks.last().unwrap();
++        if self.blocks.len() < NUM_BLOCK_HASHES {
++            let mut next = BlockHash::new();
++            next.h = last.h;
++            next.half_h = last.half_h;
++            self.blocks.push(next);
++        } else if self.last_h.is_none() {
++            self.last_h = Some(last.h);
++        }
++    }
++
++    /// Stops computing the hash for the smallest block size once it is
++    /// clear that it won't be used in the final digest.
++    fn try_reduce(&mut self) {
++        if self.blocks.len() - self.start < 2 {
++            return;
++        }
++        if block_size(self.start) * SPAMSUM_LENGTH as u64 >= self.total_size
++        {
++            return;
++        }
++        if self.blocks[self.start + 1].len < SPAMSUM_LENGTH / 2 {
++            return;
++        }
++        self.start += 1;
++    }
++
++    fn update(&mut self, c: u8) {
++        self.roll.update(c);
++
++        for block in &mut self.blocks[self.start..] {
++            block.h = sum_hash(c, block.h);
++            block.half_h = sum_hash(c, block.half_h);
++        }
++
++        if let Some(h) = self.last_h.as_mut() {
++            *h = sum_hash(c, *h);
++        }
++
++        let sum = self.roll.sum() as u64;
++        let mut i = self.start;
++
++        // A piece ends for block size `bs` when sum % bs == bs - 1. If that
++        // doesn't happen for a block size, it doesn't for larger ones.
++        while i < self.blocks.len() {
++            let bs = block_size(i);
++
++            if sum % bs != bs - 1 {
++                break;
++            }
++
++            if self.blocks[i].len == 0 {
++                self.fork();
++            }
++
++            let block = &mut self.blocks[i];
++
++            block.digest[block.len] = B64[(block.h % 64) as usize];
++            block.half_digest = Some(B64[(block.half_h % 64) as usize]);
++
++            if block.len < SPAMSUM_LENGTH - 1 {
++                // Only start a new piece if there is room for more
++                // characters, the last character of the digest covers the
++                // rest of the input.
++                block.len += 1;
++                block.h = HASH_INIT;
++                if block.len < SPAMSUM_LENGTH / 2 {
++                    block.half_h = HASH_INIT;
++                    block.half_digest = None;
++                }
++            } else {
++                self.try_reduce();
++            }
++
++            i += 1;
++        }
++    }
++
++    fn digest(&self) -> Option<String> {
++        let roll_sum = self.roll.sum();
++        let mut bi = self.start;
++
++        // Initial guess of the block size, based on the input size.
++        while block_size(bi) * (SPAMSUM_LENGTH as u64) < self.total_size {
++            bi += 1;
++            if bi >= NUM_BLOCK_HASHES {
++                return None;
++            }
++        }
++
++        // Adjust the guess so that the first part of the digest has at least
++        // SPAMSUM_LENGTH / 2 characters, if possible.
++        bi = bi.min(self.blocks.len() - 1);
++
++        while bi > self.start && self.blocks[bi].len < SPAMSUM_LENGTH / 2 {
++            bi -= 1;
++        }
++
++        let block = &self.blocks[bi];
++        let mut result = format!("{}:", block_size(bi));
++
++        result.push_str(
++            std::str::from_utf8(&block.digest[..block.len]).unwrap(),
++        );
++
++        if roll_sum != 0 {
++            result.push(B64[(block.h % 64) as usize] as char);
++        } else if block.len < SPAMSUM_LENGTH && block.digest[block.len] != 0
++        {
++            result.push(block.digest[block.len] as char);
++        }
++
++        result.push(':');
++
++        if bi < self.blocks.len() - 1 {
++            let block = &self.blocks[bi + 1];
++            let len = block.len.min(SPAMSUM_LENGTH / 2 - 1);
++
++            result.push_str(std::str::from_utf8(&block.digest[..len]).unwrap());
++
++            if roll_sum != 0 {
++                result.push(B64[(block.half_h % 64) as usize] as char);
++            } else if let Some(c) = block.half_digest {
++                result.push(c as char);
++            }
++        } else if roll_sum != 0 {
++            let h = if bi == 0 {
++                self.blocks[bi].h
++            } else {
++                self.last_h.unwrap_or(self.blocks[bi].h)
++            };
++            result.push(B64[(h % 64) as usize] as char);
++        }
++
++        Some(result)
++    }
++}
++
++/// Computes the ssdeep digest of the given data.
++///
++/// Returns `None` only if the data is too large (more than 192 GiB).
++pub fn hash(data: &[u8]) -> Option<String> {
++    let mut hasher = Hasher::new(data.len() as u64);
++
++    for c in data {
++        hasher.update(*c);
++    }
++
++    hasher.digest()
++}
++
++/// Copies `s`, removing characters that repeat more than three times in a
++/// row. Long runs of the same character carry little information and would
++/// inflate the similarity score.
++fn eliminate_sequences(s: &[u8]) -> Vec<u8> {
++    let mut result = Vec::with_capacity(s.len());
++    for (i, c) in s.iter().enumerate() {
++        if i < 3 || *c != s[i - 1] || *c != s[i - 2] || *c != s[i - 3] {
++            result.push(*c);
++        }
++    }
++    result
++}
++
++/// Returns true if `a` and `b` have a common substring of at least
++/// [`ROLLING_WINDOW`] characters.
++fn has_common_substring(a: &[u8], b: &[u8]) -> bool {
++    if a.len() < ROLLING_WINDOW || b.len() < ROLLING_WINDOW {
++        return false;
++    }
++    a.windows(ROLLING_WINDOW).any(|w| b.windows(ROLLING_WINDOW).any(|v| v == w))
++}
++
++/// Edit distance where insertions and deletions cost 1 and substitutions 2.
++fn edit_distance(a: &[u8], b: &[u8]) -> usize {
++    let mut prev: Vec<usize> = (0..=b.len()).collect();
++    let mut cur = vec![0; b.len() + 1];
++
++    for (i, ca) in a.iter().enumerate() {
++        cur[0] = i + 1;
++        for (j, cb) in b.iter().enumerate() {
++            let replace = prev[j] + if ca == cb { 0 } else { 2 };
++            cur[j + 1] = replace.min(prev[j + 1] + 1).min(cur[j] + 1);
++        }
++        std::mem::swap(&mut prev, &mut cur);
++    }
++
++    prev[b.len()]
++}
++
++/// Similarity score between 0 and 100 of two digest parts computed with
++/// the same block size.
++fn score_strings(a: &[u8], b: &[u8], block_size: u64) -> u32 {
++    if a.len() > SPAMSUM_LENGTH || b.len() > SPAMSUM_LENGTH {
++        return 0;
++    }
++
++    if !has_common_substring(a, b) {
++        return 0;
++    }
++
++    let mut score = edit_distance(a, b) as u64;
++
++    // Scale the edit distance by the lengths of the strings, and convert it
++    // to a 0-100 scale where 100 means identical.
++    score = (score * SPAMSUM_LENGTH as u64) / (a.len() + b.len()) as u64;
++    score = (100 * score) / SPAMSUM_LENGTH as u64;
++    score = 100 - score;
++
++    // When the block size is small, don't exaggerate the match size.
++    let threshold = (99 + ROLLING_WINDOW as u64) / ROLLING_WINDOW as u64
++        * MIN_BLOCK_SIZE;
++
++    if block_size < threshold {
++        let cap = block_size / MIN_BLOCK_SIZE * a.len().min(b.len()) as u64;
++        score = score.min(cap);
++    }
++
++    score as u32
++}
++
++/// A parsed digest: block size and the two parts.
++struct Digest<'a> {
++    block_size: u64,
++    part1: &'a [u8],
++    part2: &'a [u8],
++}
++
++fn parse(digest: &str) -> Option<Digest<'_>> {
++    let (block_size, rest) = digest.split_once(':')?;
++
++    if block_size.is_empty() || !block_size.bytes().all(|c| c.is_ascii_digit())
++    {
++        return None;
++    }
++
++    let block_size = block_size.parse::<u64>().ok()?;
++    let (part1, part2) = rest.split_once(':')?;
++
++    // The digest may be followed by a comma and a file name, as in the
++    // output of the `ssdeep` tool.
++    let part2 = match part2.split_once(',') {
++        Some((p, _)) => p,
++        None => part2,
++    };
++
++    if part1.len() > SPAMSUM_LENGTH || part2.len() > SPAMSUM_LENGTH {
++        return None;
++    }
++
++    Some(Digest {
++        block_size,
++        part1: part1.as_bytes(),
++        part2: part2.as_bytes(),
++    })
++}
++
++/// Compares two ssdeep digests and returns a similarity score between 0
++/// (no similarity) and 100 (identical or near-identical).
++///
++/// Returns `None` if any of the digests is malformed.
++pub fn compare(digest1: &str, digest2: &str) -> Option<u32> {
++    let d1 = parse(digest1)?;
++    let d2 = parse(digest2)?;
++
++    let (bs1, bs2) = (d1.block_size, d2.block_size);
++
++    // Digests can only be compared if their block sizes are equal or one
++    // is twice the other.
++    if bs1 != bs2
++        && bs1.checked_mul(2) != Some(bs2)
++        && (bs1 % 2 == 1 || bs1 / 2 != bs2)
++    {
++        return Some(0);
++    }
++
++    let a1 = eliminate_sequences(d1.part1);
++    let a2 = eliminate_sequences(d1.part2);
++    let b1 = eliminate_sequences(d2.part1);
++    let b2 = eliminate_sequences(d2.part2);
++
++    if bs1 == bs2 && a1 == b1 && a2 == b2 {
++        return Some(100);
++    }
++
++    let score = if bs1 == bs2 {
++        score_strings(&a1, &b1, bs1).max(score_strings(&a2, &b2, bs1 * 2))
++    } else if bs1 == bs2 * 2 {
++        score_strings(&a1, &b2, bs1)
++    } else {
++        score_strings(&a2, &b1, bs2)
++    };
++
++    Some(score)
++}
+diff --git a/lib/src/modules/hash/tests/mod.rs b/lib/src/modules/hash/tests/mod.rs
+index ac40fb5d..b4c531a5 100644
+--- a/lib/src/modules/hash/tests/mod.rs
++++ b/lib/src/modules/hash/tests/mod.rs
+@@ -110,4 +110,46 @@ fn checksum32_chunks_match_byte_sum() {
+ 
+     assert_eq!(super::checksum32(&data), expected);
+     assert_eq!(super::checksum32(&[255; 257]), 65_535);
++
++    rule_true!(
++        r#"
++        import "hash"
++        rule test {
++          condition:
++            hash.ssdeep(0, filesize) == "3:Nx:X" and
++            hash.ssdeep(3, 3) == "3:e:e" and
++            hash.ssdeep(0, filesize) == hash.ssdeep("foobarbaz") and
++            hash.ssdeep("") == "3::" and
++            hash.ssdeep("TEST STRING") == "3:P2:u"
++        }
++        "#,
++        b"foobarbaz"
++    );
++
++    rule_false!(
++        r#"
++        import "hash"
++        rule test {
++          condition:
++            defined hash.ssdeep(5, 10)
++        }
++        "#,
++        b"foobarbaz"
++    );
++
++    rule_true!(
++        r#"
++        import "hash"
++        rule test {
++          condition:
++            hash.ssdeep_compare(
++              "96:nq9vmZZHqJpXIHj6erzlhuRECLasXiOum7+bF7754SGHOC2:G4wJpXs/rzl7Cbcm2d1n",
++              "96:nq9vmZZHqJpXIHj6erzlhuRECLaNiOum7+bF7754SGHOC2:G4wJpXs/rzl7Cvm2d1n") == 97 and
++            hash.ssdeep_compare("3:uH:uH", "3:uH:uH") == 100 and
++            hash.ssdeep_compare("3:uH:uH", "96:nq9vmZZHqJpXIHj6:G4wJ") == 0 and
++            not defined hash.ssdeep_compare("not a digest", "3:uH:uH")
++        }
++        "#,
++        b""
++    );
+ }
+diff --git a/site/content/docs/modules/hash.md b/site/content/docs/modules/hash.md
+index b45d9191..a99127c8 100644
+--- a/site/content/docs/modules/hash.md
++++ b/site/content/docs/modules/hash.md
+@@ -18,9 +18,9 @@ seo:
+   noindex: false # false (default) or true
+ ---
+ 
+-The `hash` module allows you to calculate hashes (MD5, SHA1, SHA256) and
+-checksums from portions of your file and create signatures based on those
+-hashes.
++The `hash` module allows you to calculate hashes (MD5, SHA1, SHA256), fuzzy
++hashes (ssdeep) and checksums from portions of your file and create signatures
++based on those hashes.
+ 
+ -------
+ 
+@@ -28,7 +28,8 @@ hashes.
+ 
+ {{< callout context="caution" title="Important">}}
+ 
+-Hashes returned by the functions below are always in lowercase.
++Hashes returned by the functions below are always in lowercase, except for
++ssdeep hashes, which are case-sensitive.
+ 
+ {{< /callout >}}
+ 
+@@ -82,4 +83,27 @@ Returns a crc32 checksum for the size bytes starting at offset.
+ 
+ ### crc32(string)
+ 
+-Returns a crc32 checksum for the given string.
+\ No newline at end of file
++Returns a crc32 checksum for the given string.
++
++### ssdeep(offset, size)
++
++Returns the [ssdeep](https://ssdeep-project.github.io/ssdeep/) fuzzy hash
++(context triggered piecewise hash) for the size bytes starting at offset. The
++result is the same as the one produced by the `ssdeep` tool, and the one shown
++by VirusTotal.
++
++Example: `hash.ssdeep(0, filesize) == "3:Nx:X"`
++
++### ssdeep(string)
++
++Returns the ssdeep fuzzy hash for the given string.
++
++### ssdeep_compare(hash1, hash2)
++
++Compares two ssdeep hashes and returns a similarity score between 0 (no
++similarity) and 100 (identical or near-identical files). The result is
++undefined if any of the hashes is malformed. Hashes can only be compared if
++their block sizes (the number before the first colon) are equal or one is
++twice the other, otherwise the score is 0.
++
++Example: `hash.ssdeep_compare(hash.ssdeep(0, filesize), "96:nq9vmZZHqJpXIHj6erzlhuRECLaNiOum7+bF7754SGHOC2:G4wJpXs/rzl7Cvm2d1n") > 80`

@@ -1,0 +1,346 @@
+diff --git a/configure.ac b/configure.ac
+index 1e3ef805..4d9cb0ef 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -179,6 +179,16 @@ AC_ARG_ENABLE([magic],
+     PC_LIBS_PRIVATE="$PC_LIBS_PRIVATE -lmagic"
+   fi])
+ 
++AC_ARG_ENABLE([ssdeep],
++  [AS_HELP_STRING([--enable-ssdeep], [enable ssdeep fuzzy hashing in the hash module])],
++  [if test x$enableval = xyes; then
++    build_ssdeep=true
++    AC_CHECK_HEADERS([fuzzy.h],,
++      AC_MSG_ERROR([please install libfuzzy library]))
++    AC_CHECK_LIB(fuzzy, fuzzy_new,,
++      AC_MSG_ERROR([please install libfuzzy library >= 2.10]))
++  fi])
++
+ AC_ARG_ENABLE([macho],
+   [AS_HELP_STRING([--enable-macho], [enable macho module])],
+   [if test x$enableval = xyes; then
+@@ -375,6 +385,18 @@ AS_IF([test "x$have_crypto" = "xno"],
+ 
+ 
+ 
++AS_IF([test x$build_ssdeep = xtrue],
++  [
++    AS_IF([test x$build_hash_module = xtrue],
++      [
++        CFLAGS="$CFLAGS -DHASH_SSDEEP"
++        PC_LIBS_PRIVATE="$PC_LIBS_PRIVATE -lfuzzy"
++      ],
++      [
++        AC_MSG_ERROR([--enable-ssdeep requires the "hash" module, which needs a crypto library])
++      ])
++  ])
++
+ AM_CONDITIONAL([GCC], [test "x$GCC" = xyes])
+ AM_CONDITIONAL([PROTOC], [test "x${PROTOC}" != "x"])
+ AM_CONDITIONAL([DEBUG], [test x$debug = xtrue])
+diff --git a/docs/gettingstarted.rst b/docs/gettingstarted.rst
+index 59f2473d..bbd0d9d7 100644
+--- a/docs/gettingstarted.rst
++++ b/docs/gettingstarted.rst
+@@ -49,6 +49,9 @@ The following modules are not compiled into YARA by default:
+ * cuckoo
+ * magic
+ 
++The ``ssdeep`` fuzzy hashing functions in the hash module are also optional and
++require ``--enable-ssdeep``.
++
+ If you plan to use them you must pass the corresponding ``--enable-<module
+ name>`` arguments to the ``configure`` script.
+ 
+@@ -76,6 +79,11 @@ choose to install you'll need the following libraries:
+         ``libmagic-dev``. The source code can be found
+         `here <ftp://ftp.astron.com/pub/file/>`_.
+ 
++* ssdeep (hash module):
++        Depends on *libfuzzy* 2.10 or later, the library behind the
++        `ssdeep <https://ssdeep-project.github.io/ssdeep/>`_ program.
++        Ubuntu and Debian include a package named ``libfuzzy-dev``.
++
+ Installing with vcpkg
+ ---------------------
+ 
+diff --git a/docs/modules/hash.rst b/docs/modules/hash.rst
+index 8829ed2c..84d9b1d5 100644
+--- a/docs/modules/hash.rst
++++ b/docs/modules/hash.rst
+@@ -78,3 +78,28 @@ of your file and create signatures based on those hashes.
+ 
+     Returns a crc32 checksum for the given string.
+ 
++.. c:function:: ssdeep(offset, size)
++
++    .. versionadded:: 4.6.1
++
++    Returns the `ssdeep <https://ssdeep-project.github.io/ssdeep/>`_ fuzzy
++    hash (context triggered piecewise hash) for the *size* bytes starting at
++    *offset*. Only available if YARA was built with ``--enable-ssdeep``.
++
++    *Example: hash.ssdeep(0, filesize) == "3:uH:uH"*
++
++.. c:function:: ssdeep(string)
++
++    .. versionadded:: 4.6.1
++
++    Returns the ssdeep fuzzy hash for the given string.
++
++.. c:function:: ssdeep_compare(digest1, digest2)
++
++    .. versionadded:: 4.6.1
++
++    Compares two ssdeep digests and returns a similarity score between 0
++    (no similarity) and 100 (identical or near-identical). The result is
++    undefined if any of the digests is malformed.
++
++    *Example: hash.ssdeep_compare(hash.ssdeep(0, filesize), "96:nq9vmZZHq...:G4wJ...") > 80*
+diff --git a/libyara/modules/hash/hash.c b/libyara/modules/hash/hash.c
+index 71fc6970..8091a5df 100644
+--- a/libyara/modules/hash/hash.c
++++ b/libyara/modules/hash/hash.c
+@@ -34,6 +34,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ 
+ #include "../crypto.h"
+ 
++#if defined(HASH_SSDEEP)
++#include <fuzzy.h>
++#endif
++
+ #define MODULE_NAME hash
+ 
+ typedef struct _CACHE_KEY
+@@ -816,6 +820,164 @@ define_function(data_crc32)
+   return_integer(checksum ^ 0xFFFFFFFF);
+ }
+ 
++#if defined(HASH_SSDEEP)
++
++define_function(string_ssdeep)
++{
++  char digest[FUZZY_MAX_RESULT];
++  SIZED_STRING* s = sized_string_argument(1);
++
++  if (fuzzy_hash_buf(
++          (const unsigned char*) s->c_string, (uint32_t) s->length, digest) !=
++      0)
++  {
++    return_string(YR_UNDEFINED);
++  }
++
++  YR_DEBUG_FPRINTF(
++      2,
++      stderr,
++      "- %s() {} = %s // s->length=%u\n",
++      __FUNCTION__,
++      digest,
++      s->length);
++
++  return_string(digest);
++}
++
++define_function(data_ssdeep)
++{
++  struct fuzzy_state* state;
++
++  char digest[FUZZY_MAX_RESULT];
++  char* cached_digest;
++
++  bool past_first_block = false;
++
++  YR_SCAN_CONTEXT* context = yr_scan_context();
++  YR_MEMORY_BLOCK* block = first_memory_block(context);
++  YR_MEMORY_BLOCK_ITERATOR* iterator = context->iterator;
++
++  int64_t arg_offset = integer_argument(1);  // offset where to start
++  int64_t arg_length = integer_argument(2);  // length of bytes we want hash on
++
++  int64_t offset = arg_offset;
++  int64_t length = arg_length;
++
++  YR_DEBUG_FPRINTF(
++      2,
++      stderr,
++      "+ %s(offset=%" PRIi64 " length=%" PRIi64 ") {\n",
++      __FUNCTION__,
++      offset,
++      length);
++
++  if (block == NULL)
++    return_string(YR_UNDEFINED);
++
++  if (offset < 0 || length < 0 || offset < block->base)
++    return_string(YR_UNDEFINED);
++
++  cached_digest = get_from_cache(
++      yr_module(), "ssdeep", arg_offset, arg_length);
++
++  if (cached_digest != NULL)
++  {
++    YR_DEBUG_FPRINTF(
++        2, stderr, "} // %s() = %s (cached)\n", __FUNCTION__, cached_digest);
++
++    return_string(cached_digest);
++  }
++
++  state = fuzzy_new();
++
++  if (state == NULL)
++    return_string(YR_UNDEFINED);
++
++  foreach_memory_block(iterator, block)
++  {
++    // if desired block within current block
++
++    if (offset >= block->base && offset < block->base + block->size)
++    {
++      const uint8_t* block_data = yr_fetch_block_data(block);
++
++      if (block_data != NULL)
++      {
++        size_t data_offset = (size_t) (offset - block->base);
++        size_t data_len = (size_t) yr_min(
++            length, (size_t) (block->size - data_offset));
++
++        offset += data_len;
++        length -= data_len;
++
++        if (fuzzy_update(state, block_data + data_offset, data_len) != 0)
++        {
++          fuzzy_free(state);
++          return_string(YR_UNDEFINED);
++        }
++      }
++
++      past_first_block = true;
++    }
++    else if (past_first_block)
++    {
++      // If offset is not within current block and we already
++      // past the first block then the we are trying to compute
++      // the hash over a range of non contiguous blocks. As
++      // range contains gaps of undefined data the hash is
++      // undefined.
++
++      fuzzy_free(state);
++      return_string(YR_UNDEFINED);
++    }
++
++    if (block->base + block->size >= offset + length)
++      break;
++  }
++
++  if (!past_first_block || fuzzy_digest(state, digest, 0) != 0)
++  {
++    fuzzy_free(state);
++    return_string(YR_UNDEFINED);
++  }
++
++  fuzzy_free(state);
++
++  FAIL_ON_ERROR(
++      add_to_cache(yr_module(), "ssdeep", arg_offset, arg_length, digest));
++
++  YR_DEBUG_FPRINTF(2, stderr, "} // %s() = %s\n", __FUNCTION__, digest);
++  return_string(digest);
++}
++
++define_function(ssdeep_compare)
++{
++  SIZED_STRING* s1 = sized_string_argument(1);
++  SIZED_STRING* s2 = sized_string_argument(2);
++
++  // fuzzy_compare() expects NULL-terminated strings, reject anything that
++  // contains embedded zeroes or that is too long to be a valid digest.
++  if (strlen(s1->c_string) != s1->length ||
++      strlen(s2->c_string) != s2->length ||
++      s1->length >= FUZZY_MAX_RESULT || s2->length >= FUZZY_MAX_RESULT)
++  {
++    return_integer(YR_UNDEFINED);
++  }
++
++  int score = fuzzy_compare(s1->c_string, s2->c_string);
++
++  YR_DEBUG_FPRINTF(2, stderr, "- %s() {} = %d\n", __FUNCTION__, score);
++
++  // fuzzy_compare() returns -1 if any of the digests is malformed.
++  if (score < 0)
++    return_integer(YR_UNDEFINED);
++
++  return_integer(score);
++}
++
++#endif  // HASH_SSDEEP
++
+ begin_declarations
+   declare_function("md5", "ii", "s", data_md5);
+   declare_function("md5", "s", "s", string_md5);
+@@ -831,6 +993,12 @@ begin_declarations
+ 
+   declare_function("crc32", "ii", "i", data_crc32);
+   declare_function("crc32", "s", "i", string_crc32);
++
++#if defined(HASH_SSDEEP)
++  declare_function("ssdeep", "ii", "s", data_ssdeep);
++  declare_function("ssdeep", "s", "s", string_ssdeep);
++  declare_function("ssdeep_compare", "ss", "i", ssdeep_compare);
++#endif
+ end_declarations
+ 
+ int module_initialize(YR_MODULE* module)
+diff --git a/tests/test-rules.c b/tests/test-rules.c
+index c000d2af..02d1cf2e 100644
+--- a/tests/test-rules.c
++++ b/tests/test-rules.c
+@@ -3613,6 +3613,49 @@ static void test_hash_module()
+       }",
+       NULL);
+ 
++#if defined(HASH_SSDEEP)
++  assert_true_rule_blob(
++      "import \"hash\" \
++       rule test { \
++        condition: \
++          hash.ssdeep(0, filesize) == \"3:uH:uH\" \
++            and \
++          hash.ssdeep(1, filesize) == \"3:n:n\" \
++            and \
++          hash.ssdeep(0, filesize) == \"3:uH:uH\" \
++            and \
++          hash.ssdeep(\"TEST STRING\") == \"3:P2:u\" \
++      }",
++      blob);
++
++  assert_true_rule(
++      "import \"hash\" \
++       rule test { \
++        condition: \
++          hash.ssdeep_compare( \
++            \"96:nq9vmZZHqJpXIHj6erzlhuRECLasXiOum7+bF7754SGHOC2:G4wJpXs/rzl7Cbcm2d1n\", \
++            \"96:nq9vmZZHqJpXIHj6erzlhuRECLaNiOum7+bF7754SGHOC2:G4wJpXs/rzl7Cvm2d1n\") == 97 \
++            and \
++          hash.ssdeep_compare(\"3:uH:uH\", \"3:uH:uH\") == 100 \
++            and \
++          hash.ssdeep_compare(\"3:uH:uH\", \"96:nq9vmZZHqJpXIHj6:G4wJ\") == 0 \
++      }",
++      NULL);
++
++  // Malformed digests and out-of-range data yield undefined.
++  assert_false_rule_blob(
++      "import \"hash\" \
++       rule test { \
++        condition: \
++          hash.ssdeep_compare(\"not a digest\", \"3:uH:uH\") >= 0 \
++            or \
++          hash.ssdeep(10, filesize) == \"3::\" \
++            or \
++          defined hash.ssdeep(-1, 2) \
++      }",
++      blob);
++#endif
++
+   // Test hash caching mechanism
+ 
+   assert_true_rule_blob(
