@@ -1,0 +1,9 @@
+{
+  "ScanPaths": ["%SystemDrive%\\Users", "%ProgramData%", "%SystemRoot%\\Temp"],
+  "ExcludePaths": [],
+  "SkipLargerBytes": 104857600,
+  "FileTimeoutSeconds": 60,
+  "CpuLimitPercent": 50,
+  "Threads": 0,
+  "MaxRuntimeMinutes": 240
+}
